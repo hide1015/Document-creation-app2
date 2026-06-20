@@ -1,0 +1,1172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>証憑書類作成アプリ — 見積書・請求書・領収書</title>
+<meta name="theme-color" content="#1b3a5c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="証憑書類作成">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>html,body,#root{margin:0;padding:0;height:100%;}</style>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+if("serviceWorker" in navigator){
+  window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(e=>console.log("SW登録失敗",e));});
+}
+</script>
+<script type="text/babel">
+const { useState, useRef, useCallback, useEffect } = React;
+
+/* ════ Data ════ */
+const PAY_M=["工事完了後現金お支払い","工事完了後期日までに銀行お振込","工事前現金お支払い","工事前期日までに銀行お振込","クレジットカードお支払い","未定"];
+const PAY_D=["完了日当日","1週間","1ヶ月","2ヶ月","当月末","翌月末","未定"];
+const UNITS=["","式","個","M","台","枚"];
+const DOCS={
+  estimate:{label:"御見積書",icon:"📝",pc:"#1b3a5c"},
+  invoice:{label:"請求書",icon:"📨",pc:"#5c1b1b"},
+  receipt:{label:"領収書",icon:"📄",pc:"#1b4a2e"},
+};
+const CO0={zip:"",addr:"",name:"",rep:"",tel:"",email:""};
+const td=()=>{const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;};
+const fJ=s=>{if(!s)return"";const[y,m,d]=s.split("-");return`${y}年${+m}月${+d}日`;};
+const fC=n=>"¥"+Number(n||0).toLocaleString();
+const fN=n=>n?"¥"+Number(n).toLocaleString():"";
+const emp=()=>({name:"",qty:"",unit:"",cost:"",price:"",code:"",note:""});
+
+/* 防犯カメラ取付工事テンプレート */
+const TPL_CAMERA=[
+  ["カメラ取付費（高所）","式"],["配線VVF2*1.6","M"],["VE管","M"],["VE管フレキ","M"],
+  ["フレキ管","M"],["コルゲートチューブ","M"],["防水ボックス","個"],["露出ボックス","個"],
+  ["エルボ","個"],["カップリング","個"],["カップリングPF管用","個"],["コネクタ","個"],
+  ["PF管コネクタ","個"],["ノーマルベンド","個"],["フレキシブルベンド","個"],["台付サドル","個"],
+  ["埋込コンセント","個"],["トリプルコンセント（室内）","個"],["スナップキャップ（室内）","個"],
+  ["パネルボックス","個"],["コンセントプレート","個"],["フル接地防水ダブルコンセント（2コ口）","個"],
+  ["スマート接地防水コンセント（2コ口）","個"],["ケーブルタイ固定具","個"],["ニュー・エフモール","M"],
+  ["ニュー・エフモール　マガリ","個"],["カメラ取付金具","個"],["カメラ天吊り金具","個"],["諸経費","式"],
+];
+
+/* ════ Seal ════ */
+const SealSVG=({size=72})=>(
+  <svg width={size} height={size} viewBox="0 0 100 100" style={{filter:"drop-shadow(0 1px 2px rgba(160,30,30,0.25))"}}>
+    <rect x="4" y="4" width="92" height="92" rx="4" fill="none" stroke="#b32828" strokeWidth="3.5"/>
+    <rect x="9" y="9" width="82" height="82" rx="2" fill="none" stroke="#b32828" strokeWidth="1"/>
+  </svg>
+);
+const SealImg=({size=72,src=null})=>src
+  ?<img src={src} alt="印" style={{width:size,height:size,objectFit:"contain"}}/>
+  :<SealSVG size={size}/>;
+
+/* ════ PrintDoc (A4) ════ */
+const PrintDoc=({d,dt,co,seal,bank})=>{
+  const pc=DOCS[dt].pc;
+  const nk=dt==="estimate"?"notesEstimate":dt==="invoice"?"notesInvoice":"notesReceipt";
+  const items=d.items.filter(i=>i.name||i.qty||i.price||i.code||i.note);
+  const sub=items.reduce((s,i)=>s+(+i.qty||0)*(+i.price||0),0);
+  const tx=Math.floor(sub*(+d.taxRate||0)/100);
+  const tot=sub+tx;
+  const hdr=dt==="estimate"?"下記の通り御見積申し上げます。":dt==="invoice"?"下記の通りご請求申し上げます。":"下記の金額、正に領収いたしました。";
+  const minRows=10;
+  const dataRows=items.length?items:[];
+  const rowCount=Math.max(minRows,dataRows.length);
+  const padCount=Math.max(0,minRows-dataRows.length);
+  const rows=[...dataRows,...Array(padCount).fill(emp())];
+  const pf="'M PLUS Rounded 1c','Hiragino Maru Gothic ProN','Rounded Mplus 1c',sans-serif";
+  const bdr="0.5pt solid #bbb";
+
+  // 連続スケーリング: 行数に応じて0~1のスケール値を算出
+  // 15行以下=1.0, 20行≈0.82, 25行≈0.65, 30行≈0.47, 35行≈0.30
+  const s=rowCount<=15?1:Math.max(0.28,1-((rowCount-15)*0.035));
+  // ptとmmのスケール（フォントはやや緩やか、余白は積極的に縮小）
+  const pt=v=>(Math.max(4.5,v*Math.max(s,0.45)).toFixed(1))+"pt";
+  const mm=v=>(Math.max(0.3,v*s).toFixed(1))+"mm";
+  const mms=v=>(Math.max(0.2,v*s*s).toFixed(1))+"mm"; // 余白用（二乗で積極的に圧縮）
+
+  return(
+    <div style={{width:"210mm",height:"297mm",padding:`${mms(10)} ${mm(12)} ${mms(8)}`,fontFamily:pf,fontSize:pt(8),color:"#1a1a1a",background:"#fff",boxSizing:"border-box",display:"flex",flexDirection:"column",position:"relative",overflow:"hidden"}}>
+      {/* タイトル */}
+      <div style={{textAlign:"center",marginBottom:mms(4)}}>
+        <h1 style={{fontSize:pt(20),fontWeight:800,letterSpacing:pt(Math.max(4,12*s)),color:pc,margin:0,padding:`${mms(2.5)} 0`,display:"inline-block",borderTop:`3px double ${pc}`,borderBottom:`3px double ${pc}`,paddingLeft:pt(Math.max(6,16*s)),paddingRight:"4pt"}}>{DOCS[dt].label}</h1>
+      </div>
+      {/* 日付 */}
+      <div style={{textAlign:"right",marginBottom:mms(3),fontSize:pt(8.5)}}>{fJ(d.date)}</div>
+      {/* 顧客情報 + 会社情報 */}
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:mms(3),position:"relative"}}>
+        <div style={{flex:1,maxWidth:"52%"}}>
+          <div style={{fontSize:pt(13),fontWeight:700,borderBottom:`2px solid ${pc}`,paddingBottom:"1mm",marginBottom:mms(2),display:"inline-block",minWidth:"60%"}}>{d.customerName||"　"} <span style={{fontSize:pt(10),fontWeight:400}}>様</span></div>
+          <div style={{fontSize:pt(7.5),lineHeight:1.4,marginTop:"0.5mm"}}>{hdr}</div>
+          <table style={{fontSize:pt(7.5),marginTop:mms(2),borderCollapse:"collapse",width:"100%"}}><tbody>
+            {[["物件名称",d.propertyName],["物件住所",d.propertyAddress],["支払条件",d.paymentMethod],["支払期限",d.paymentDeadline],
+              ...(dt==="estimate"?[["工事予定",d.constructionDate?fJ(d.constructionDate):""],["有効期限",d.validUntil?fJ(d.validUntil):""]]:
+              [["工事完了日",d.completionDate?fJ(d.completionDate):""]])
+            ].map(([l,v],i)=>(
+              <tr key={i}><td style={{padding:`${mms(1.2)} ${mms(2.5)}`,fontWeight:600,background:"#f5f3ef",whiteSpace:"nowrap",width:"22%",border:"0.5pt solid #ccc",fontSize:pt(7)}}>{l}</td><td style={{padding:`${mms(1.2)} ${mms(2.5)}`,border:"0.5pt solid #ccc"}}>{v}</td></tr>
+            ))}
+          </tbody></table>
+        </div>
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"flex-end",gap:mms(3)}}>
+          <div style={{textAlign:"right",fontSize:pt(7),lineHeight:Math.max(1.25,1.8*s)}}>
+            <div>{co.zip}</div><div>{co.addr}</div>
+            <div style={{fontSize:pt(10.5),fontWeight:700,color:pc,margin:`${mms(0.8)} 0`,letterSpacing:"2pt"}}>{co.name}</div>
+            {co.rep&&<div>代表: {co.rep}</div>}{co.tel&&<div>TEL: {co.tel}</div>}{co.email&&<div>mail: {co.email}</div>}
+            {d.staff&&<div>担当: {d.staff}</div>}
+          </div>
+          {d.showSeal&&seal&&<div style={{flexShrink:0,marginTop:mms(4),opacity:0.85}}><SealImg size={Math.round(60*Math.max(s,0.5))} src={seal}/></div>}
+        </div>
+      </div>
+      {/* 工事名 */}
+      <div style={{display:"flex",alignItems:"center",margin:`${mms(1.5)} 0`,padding:`${mms(1.5)} ${mms(3)}`,background:"#f8f6f2",border:"0.5pt solid #ddd"}}>
+        <span style={{fontWeight:700,marginRight:"3mm",whiteSpace:"nowrap",fontSize:pt(7.5)}}>工事名</span>
+        <span style={{fontSize:pt(9)}}>{d.constructionName}</span>
+      </div>
+      {/* 合計金額 */}
+      <div style={{display:"flex",justifyContent:"flex-end",alignItems:"center",gap:mms(4),margin:`${mms(2.5)} 0`,padding:`${mms(2)} ${mms(4)}`,borderTop:`2.5px solid ${pc}`,borderBottom:`2.5px solid ${pc}`}}>
+        <span style={{fontSize:pt(7.5)}}>{dt==="estimate"?"御見積金額":dt==="invoice"?"ご請求金額":"金額"}</span>
+        <span style={{fontSize:pt(17),fontWeight:800,color:pc,letterSpacing:"1.5pt"}}>{fC(tot)}-</span>
+        <span style={{fontSize:pt(7.5)}}>（税込）</span>
+      </div>
+      {/* 明細テーブル - divラッパーでflex:1制御 */}
+      <div style={{flex:1,overflow:"hidden",marginTop:mms(2)}}>
+        <table style={{fontSize:pt(7.5),borderCollapse:"collapse",width:"100%",height:"100%"}}>
+          <thead><tr style={{background:pc,color:"#fff"}}>
+            {[["No","5%","center"],["品　　名","auto","left"],["数量","7%","center"],["呼称","7%","center"],["単　価","12%","right"],["金　額","13%","right"],["摘　要","14%","left"]].map(([h,w,a],i)=>(
+              <th key={i} style={{padding:`${mms(1.4)} ${mms(2.5)}`,fontWeight:600,fontSize:pt(7),width:w,textAlign:"center",verticalAlign:"middle",border:"0.5pt solid rgba(255,255,255,0.3)"}}>{h}</th>
+            ))}
+          </tr></thead>
+          <tbody>{rows.map((it,i)=>{const amt=(+it.qty||0)*(+it.price||0);return(
+            <tr key={i} style={{background:i%2===0?"#fff":"#faf9f7",height:0}}>
+              <td style={{textAlign:"center",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`,fontSize:pt(7)}}>{it.name?i+1:""}</td>
+              <td style={{textAlign:"left",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`}}>{it.name}</td>
+              <td style={{textAlign:"center",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`}}>{it.qty}</td>
+              <td style={{textAlign:"center",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`}}>{it.unit}</td>
+              <td style={{textAlign:"right",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`}}>{fN(it.price)}</td>
+              <td style={{textAlign:"right",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`}}>{amt?fC(amt):""}</td>
+              <td style={{textAlign:"left",verticalAlign:"middle",border:bdr,padding:`${mms(1.4)} ${mms(2.5)}`,fontSize:pt(7)}}>{it.note}</td>
+            </tr>);})}</tbody>
+          <tfoot>
+            {[["小　計",fC(sub)],[`消費税（${d.taxRate||0}%）`,fC(tx)]].map(([l,v],i)=>(
+              <tr key={i}><td colSpan={5} style={{textAlign:"right",fontWeight:600,background:"#f5f3ef",border:bdr,padding:`${mms(1.5)} ${mms(2.5)}`}}>{l}</td>
+              <td style={{textAlign:"right",fontWeight:600,background:"#f5f3ef",border:bdr,padding:`${mms(1.5)} ${mms(2.5)}`}}>{v}</td>
+              <td style={{background:"#f5f3ef",border:bdr}}></td></tr>
+            ))}
+            <tr style={{background:pc,color:"#fff"}}>
+              <td colSpan={5} style={{textAlign:"right",fontWeight:700,fontSize:pt(9),border:`0.5pt solid ${pc}`,padding:`${mms(1.5)} ${mms(2.5)}`}}>合　計</td>
+              <td style={{textAlign:"right",fontWeight:700,fontSize:pt(10),border:`0.5pt solid ${pc}`,padding:`${mms(1.5)} ${mms(2.5)}`}}>{fC(tot)}</td>
+              <td style={{border:`0.5pt solid ${pc}`}}></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+      {/* 備考 */}
+      <div style={{marginTop:mms(3),flexShrink:0}}>
+        <div style={{fontSize:pt(7.5),fontWeight:700,padding:`${mms(1.5)} ${mms(2.5)}`,background:"#f5f3ef",border:"0.5pt solid #ccc",borderBottom:"none"}}>備　　考</div>
+        <div style={{fontSize:pt(7),padding:mms(2.5),border:"0.5pt solid #ccc",minHeight:mms(8),lineHeight:1.4,whiteSpace:"pre-wrap"}}>
+          {d[nk]}
+          {dt==="invoice"&&bank&&(bank.name||bank.number||bank.holder)&&(
+            <div style={{marginTop:mms(2),paddingTop:mms(1.5),borderTop:"0.5pt dashed #ccc",whiteSpace:"normal"}}>
+              <span style={{fontWeight:700}}>【お振込先】</span><br/>
+              {bank.name}{bank.branch?`　${bank.branch}`:""}　{bank.type||"普通"}　{bank.number}<br/>
+              {bank.holder&&<>名義: {bank.holder}<br/></>}
+              {bank.feeNote&&<span>※ 振込手数料はお客様にてご負担いただけますようお願い申し上げます。</span>}
+            </div>
+          )}
+        </div>
+      </div>
+      {/* フッター */}
+      <div style={{paddingTop:mms(2),borderTop:"1px solid #eee",fontSize:pt(6),color:"#aaa",textAlign:"center",letterSpacing:"0.5pt",flexShrink:0}}>{[co.name,co.email].filter(Boolean).join("　｜　")}</div>
+    </div>
+  );
+};
+
+/* ════ CSS ════ */
+const CSS=`
+@import url('https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@300;400;500;700;800&display=swap');
+:root{
+  --bg:#ececec;--card:#fff;--bdr:rgba(0,0,0,0.09);
+  --t1:#1d1d1f;--t2:#6e6e73;--t3:#aeaeb2;
+  --blue:#007aff;--blue-bg:rgba(0,122,255,0.08);
+  --green:#34c759;--red:#ff3b30;
+  --inp:rgba(0,0,0,0.04);--inp-f:rgba(0,122,255,0.15);
+  --sh:0 1px 3px rgba(0,0,0,0.08),0 0 0 .5px rgba(0,0,0,0.06);
+  --r:10px;--rs:7px;
+  --font:'M PLUS Rounded 1c','Hiragino Maru Gothic ProN',-apple-system,BlinkMacSystemFont,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+input,select,textarea,button{font-family:var(--font);}
+
+.app{font-family:var(--font);height:100vh;display:flex;flex-direction:column;
+  background:var(--bg);color:var(--t1);font-size:13px;-webkit-font-smoothing:antialiased;}
+
+/* Titlebar */
+.tbar{height:52px;display:flex;align-items:center;padding:0 16px;
+  background:linear-gradient(180deg,#f6f6f6,#e8e8e8);border-bottom:1px solid rgba(0,0,0,0.15);
+  position:sticky;top:0;z-index:100;flex-shrink:0;}
+.dots{display:flex;gap:8px;margin-right:16px;flex-shrink:0;}
+.dot{width:12px;height:12px;border-radius:50%;border:.5px solid rgba(0,0,0,0.12);}
+.tbar-c{flex:1;text-align:center;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:6px;}
+.tbar-r{display:flex;gap:6px;align-items:center;}
+
+.tb{padding:6px 14px;border-radius:7px;font-size:12px;font-weight:500;border:.5px solid rgba(0,0,0,0.12);
+  cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:5px;font-family:var(--font);white-space:nowrap;}
+.tb-d{background:rgba(255,255,255,0.7);color:var(--t2);}
+.tb-d:hover{background:rgba(255,255,255,0.95);}
+.tb-b{background:var(--blue);color:#fff;border-color:transparent;box-shadow:0 1px 4px rgba(0,122,255,0.3);}
+.tb-b:hover{filter:brightness(1.08);}
+
+/* Body */
+.bod{display:flex;flex:1;overflow:hidden;}
+
+/* Sidebar */
+.sb{width:220px;flex-shrink:0;padding:12px;background:rgba(245,243,240,0.82);
+  backdrop-filter:blur(30px);-webkit-backdrop-filter:blur(30px);
+  border-right:1px solid var(--bdr);display:flex;flex-direction:column;overflow-y:auto;}
+.sb-l{font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.6px;padding:0 8px;margin-bottom:6px;margin-top:12px;}
+.sb-i{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--rs);cursor:pointer;
+  transition:all .12s;font-size:13px;border:none;background:transparent;width:100%;text-align:left;font-family:var(--font);color:var(--t1);}
+.sb-i:hover{background:rgba(0,0,0,0.04);}
+.sb-i.on{background:var(--blue);color:#fff;font-weight:500;}
+.sb-ic{font-size:16px;width:22px;text-align:center;flex-shrink:0;}
+.sb-div{height:1px;background:var(--bdr);margin:8px 4px;}
+.sb-cv{font-size:12px;padding:6px 10px;border-radius:6px;border:.5px solid var(--bdr);background:var(--card);
+  cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:6px;color:var(--t2);width:100%;font-family:var(--font);margin-bottom:4px;}
+.sb-cv:hover{background:var(--blue-bg);color:var(--blue);border-color:var(--blue);}
+
+/* Content */
+.cnt{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+.scr{flex:1;overflow-y:auto;padding:20px;}
+
+/* Seg */
+.seg{display:inline-flex;background:var(--inp);border-radius:8px;padding:2px;gap:1px;}
+.seg-b{padding:6px 16px;border-radius:6px;font-size:12px;font-weight:500;border:none;cursor:pointer;
+  transition:all .2s;background:transparent;color:var(--t2);font-family:var(--font);}
+.seg-b.on{background:var(--card);color:var(--t1);box-shadow:0 1px 3px rgba(0,0,0,0.1),0 0 0 .5px rgba(0,0,0,0.04);font-weight:700;}
+
+/* Card */
+.mc{background:var(--card);border-radius:var(--r);border:.5px solid var(--bdr);box-shadow:var(--sh);padding:16px 18px;margin-bottom:14px;}
+.mc-t{font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px;}
+
+/* Form */
+.mf{display:flex;flex-direction:column;gap:4px;}
+.mf label{font-size:12px;font-weight:500;color:var(--t2);}
+.mf input,.mf select,.mf textarea{padding:8px 10px;border-radius:var(--rs);border:.5px solid var(--bdr);
+  font-size:13px;background:var(--card);color:var(--t1);transition:all .15s;outline:none;width:100%;font-family:var(--font);}
+.mf input:focus,.mf select:focus,.mf textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px var(--inp-f);}
+.mf textarea{resize:vertical;min-height:64px;line-height:1.6;}
+.mg{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.ms2{grid-column:span 2;}
+
+/* Sheet table */
+.sheet-wrap{overflow-x:auto;}
+.sheet{width:100%;border-collapse:collapse;font-size:13px;}
+.sheet thead th{
+  padding:8px 10px;font-size:11px;font-weight:700;color:var(--t3);
+  text-transform:uppercase;letter-spacing:.3px;
+  background:#fafafa;border-bottom:1.5px solid var(--bdr);
+  position:sticky;top:0;white-space:nowrap;text-align:center;
+}
+.sheet thead th:first-child{border-left:none;}
+.sheet thead th:last-child{border-right:none;}
+.sh-no{width:36px;text-align:center!important;color:var(--t3);font-weight:600;font-size:12px;font-variant-numeric:tabular-nums;}
+.sh-name{min-width:150px;}
+.sh-qty{width:70px;}
+.sh-unit{width:62px;}
+.sh-cost{width:90px;}
+.sh-price{width:90px;}
+.sh-amount{width:100px;text-align:right!important;font-variant-numeric:tabular-nums;color:var(--blue);font-weight:600;padding:8px 12px!important;}
+.sh-code{min-width:100px;}
+.sh-note2{min-width:110px;}
+.sh-profit{width:90px;text-align:right!important;font-variant-numeric:tabular-nums;font-size:12px;}
+.sh-del{width:36px;text-align:center!important;}
+.sh-grip{width:28px;text-align:center!important;cursor:grab;user-select:none;-webkit-user-select:none;}
+.grip-icon{color:var(--t3);font-size:14px;letter-spacing:-2px;cursor:grab;transition:color .15s;}
+.grip-desk{display:inline;}
+.grip-mob{display:none;flex-direction:column;gap:1px;align-items:center;}
+.mv-btn{width:22px;height:16px;border:none;border-radius:3px;background:transparent;color:var(--t3);
+  font-size:8px;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;transition:all .12s;}
+.mv-btn:hover:not(:disabled){background:var(--blue-bg);color:var(--blue);}
+.mv-btn:disabled{opacity:0.2;cursor:default;}
+.sh-row:hover .grip-icon{color:var(--blue);}
+.sh-dragging{opacity:0.4;background:#e8f0fe!important;}
+.sh-dragging td{background:#e8f0fe!important;}
+.sh-over{box-shadow:inset 0 -2px 0 var(--blue);}
+.sh-row{transition:box-shadow .1s;}
+.sh-row td{
+  padding:2px 4px;border-bottom:.5px solid var(--bdr);
+  vertical-align:middle;transition:background .1s;
+}
+.sh-row:hover td{background:var(--blue-bg);}
+.sh-row:nth-child(even) td{background:rgba(0,0,0,0.015);}
+.sh-row:nth-child(even):hover td{background:var(--blue-bg);}
+
+/* Sheet inputs */
+.si{
+  width:100%;padding:7px 8px;border:none;border-radius:4px;
+  font-size:13px;font-family:var(--font);color:var(--t1);
+  background:transparent;outline:none;transition:background .15s,box-shadow .15s;
+}
+.si:hover{background:rgba(0,0,0,0.03);}
+.si:focus{background:var(--card);box-shadow:0 0 0 2px var(--blue);border-radius:4px;}
+.si-r{text-align:right;}
+.si-c{text-align:center;cursor:pointer;appearance:auto;}
+.si::placeholder{color:var(--t3);font-weight:400;}
+input[type=number].si{-moz-appearance:textfield;}
+input[type=number].si::-webkit-inner-spin-button,
+input[type=number].si::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}
+select.si{padding:7px 4px;}
+
+.sh-del-btn{
+  width:22px;height:22px;border:none;border-radius:50%;background:transparent;
+  color:var(--t3);cursor:pointer;font-size:14px;transition:all .15s;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.sh-del-btn:hover{background:rgba(255,59,48,0.1);color:var(--red);}
+
+/* Stepper */
+.stepper{display:flex;align-items:center;gap:0;border-radius:6px;overflow:hidden;border:.5px solid var(--bdr);background:var(--card);}
+.st-btn{
+  width:26px;height:28px;border:none;background:#f2f2f7;color:var(--blue);
+  font-size:15px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:background .12s;flex-shrink:0;font-family:var(--font);
+}
+.st-btn:hover{background:#e5e5ea;}
+.st-btn:active{background:#d1d1d6;}
+.st-val{
+  width:36px;text-align:center;border:none;border-left:.5px solid var(--bdr);border-right:.5px solid var(--bdr);
+  padding:4px 2px;font-size:13px;background:var(--card);outline:none;font-family:var(--font);color:var(--t1);
+  -moz-appearance:textfield;
+}
+.st-val::-webkit-inner-spin-button,.st-val::-webkit-outer-spin-button{-webkit-appearance:none;margin:0;}
+.st-val:focus{box-shadow:inset 0 0 0 1.5px var(--blue);}
+
+.sh-foot td{padding:8px 12px;border-bottom:.5px solid var(--bdr);background:#fafafa;font-size:13px;}
+.sh-total td{padding:10px 12px;background:#f0f4ff;color:var(--blue);}
+
+/* Sum */
+.ms{background:rgba(0,0,0,0.025);border-radius:var(--r);padding:14px 16px;border:.5px solid var(--bdr);}
+.ms-r{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:var(--t2);}
+.ms-t{display:flex;justify-content:space-between;font-size:18px;font-weight:800;color:var(--blue);
+  padding-top:10px;margin-top:8px;border-top:1px solid var(--bdr);}
+
+/* Toggle */
+.tg{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;user-select:none;}
+.tt{width:42px;height:24px;border-radius:12px;background:#d1d1d6;position:relative;transition:background .25s;flex-shrink:0;}
+.tt.on{background:var(--green);}
+.tk{width:20px;height:20px;border-radius:50%;background:#fff;position:absolute;top:2px;left:2px;
+  transition:transform .25s;box-shadow:0 1px 3px rgba(0,0,0,0.2);}
+.tt.on .tk{transform:translateX(18px);}
+
+/* Preview */
+.pvw{background:#d5d3ce;padding:20px;display:flex;justify-content:center;align-items:flex-start;flex:1;overflow:auto;}
+.pvp{box-shadow:0 4px 24px rgba(0,0,0,0.15);transform-origin:top center;}
+
+/* Modal */
+.mo-bg{position:fixed;inset:0;background:rgba(0,0,0,0.35);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  z-index:300;display:flex;align-items:flex-start;justify-content:center;padding-top:60px;animation:mfa .2s;overflow-y:auto;}
+.mo-bx{background:#f5f5f5;border-radius:12px;width:480px;max-width:92vw;
+  box-shadow:0 24px 80px rgba(0,0,0,0.25),0 0 0 .5px rgba(0,0,0,0.1);animation:msl .25s;max-height:85vh;overflow-y:auto;}
+.mo-h{display:flex;align-items:center;justify-content:space-between;padding:16px 20px 12px;border-bottom:.5px solid var(--bdr);}
+.mo-h h2{font-size:15px;font-weight:700;}
+.mo-x{width:28px;height:28px;border-radius:50%;border:none;background:rgba(0,0,0,0.06);color:var(--t2);font-size:16px;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s;}
+.mo-x:hover{background:rgba(0,0,0,0.12);}
+.mo-bd{padding:16px 20px 20px;}
+.seal-d{width:80px;height:80px;border-radius:8px;border:2px dashed var(--bdr);display:flex;align-items:center;
+  justify-content:center;background:var(--card);flex-shrink:0;overflow:hidden;transition:border-color .2s;}
+.seal-d:hover{border-color:var(--blue);}
+input[type="file"]{border:1px solid var(--bdr);border-radius:8px;background:var(--card);cursor:pointer;}
+input[type="file"]::file-selector-button{padding:10px 16px;border:none;border-radius:6px;background:var(--blue);color:#fff;
+  font-size:13px;font-weight:500;cursor:pointer;margin-right:10px;font-family:var(--font);}
+@keyframes mfa{from{opacity:0}to{opacity:1}}
+@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+@keyframes msl{from{opacity:0;transform:translateY(-12px)}to{opacity:1;transform:translateY(0)}}
+
+/* Mobile */
+@media(max-width:768px){
+  .sb{display:none;}
+  .tbar{height:46px;padding:0 10px;}
+  .dots{display:none;}
+  .tot-info{display:none!important;}
+  .seg-b{padding:5px 12px;font-size:11px;}
+  .scr{padding:14px;}
+  .mg{grid-template-columns:1fr;}.ms2{grid-column:span 1;}
+  .pvw{padding:8px;}.pvp{transform:scale(0.45)!important;}
+  .sheet{font-size:12px;}
+  .sh-cost,.sh-code,.sh-profit{display:none;}
+  .grip-desk{display:none!important;}
+  .grip-mob{display:flex!important;}
+  .sh-name{min-width:90px;}.sh-qty{width:52px;}.sh-unit{width:48px;}.sh-price{width:75px;}.sh-amount{width:80px;padding:6px 8px!important;}
+  .si{padding:6px 4px;font-size:12px;}
+  .mbar{display:flex!important;}
+  .mseg{display:flex!important;}
+  .scr{padding-bottom:80px;}
+  .mo-bg{padding-top:20px;padding-bottom:20px;align-items:flex-start;}
+}
+@media(min-width:769px){.mbar{display:none!important;}.mseg{display:none!important;}}
+
+.mbar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:200;
+  background:rgba(248,248,248,0.88);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border-top:.5px solid var(--bdr);padding-bottom:env(safe-area-inset-bottom);}
+.mb{flex:1;padding:8px 0;text-align:center;font-size:10px;font-weight:500;color:var(--t3);
+  cursor:pointer;border:none;background:transparent;transition:color .15s;font-family:var(--font);}
+.mb.on{color:var(--blue);}
+.mb-i{font-size:20px;display:block;margin-bottom:1px;}
+.mseg{display:none;justify-content:center;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--bdr);}
+
+`;
+
+/* ════ APP ════ */
+function App(){
+  const[dt,setDt]=useState("estimate");
+  const[co,setCo]=useState(CO0);
+  const[modal,setModal]=useState(null);
+  const[sec,setSec]=useState("info");
+  const[seal,setSeal]=useState(null);
+  const[sealLoaded,setSealLoaded]=useState(false);
+  const[savedDocs,setSavedDocs]=useState([]);
+  const[proxyUrl,setProxyUrl]=useState("");
+  const[syncStatus,setSyncStatus]=useState("");
+  const[bank,setBank]=useState({name:"",branch:"",type:"普通",number:"",holder:"",feeNote:true});
+
+  // プロキシURL・振込先情報をlocalStorageから読み込み
+  useEffect(()=>{
+    try{const p=localStorage.getItem("edogawa-proxy-url");if(p)setProxyUrl(p);}catch(e){}
+    try{const b=localStorage.getItem("edogawa-bank-info");if(b)setBank({name:"",branch:"",type:"普通",number:"",holder:"",feeNote:true,...JSON.parse(b)});}catch(e){}
+  },[]);
+
+  // Favicon（書類モチーフ）
+  useEffect(()=>{
+    const svg=`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='24' fill='%231b3a5c'/><rect x='40' y='26' width='48' height='66' rx='5' fill='%23fff'/><rect x='49' y='42' width='30' height='4' rx='2' fill='%231b3a5c'/><rect x='49' y='53' width='30' height='4' rx='2' fill='%231b3a5c'/><rect x='49' y='64' width='30' height='4' rx='2' fill='%23e8c44a'/><rect x='49' y='75' width='18' height='4' rx='2' fill='%231b3a5c'/></svg>`;
+    let link=document.querySelector("link[rel='icon']");
+    if(!link){link=document.createElement("link");link.rel="icon";document.head.appendChild(link);}
+    link.type="image/svg+xml";link.href="data:image/svg+xml,"+svg;
+  },[]);
+
+  // Load seal + saved docs from localStorage
+  useEffect(()=>{
+    try{
+      const ss=localStorage.getItem("edogawa-seal");
+      if(ss) setSeal(JSON.parse(ss));
+    }catch(e){}
+    setSealLoaded(true);
+    try{
+      const ds=localStorage.getItem("edogawa-saved-docs");
+      if(ds) setSavedDocs(JSON.parse(ds));
+    }catch(e){}
+  },[]);
+
+  // Save seal to localStorage when changed
+  useEffect(()=>{
+    if(!sealLoaded) return;
+    try{
+      if(seal){ localStorage.setItem("edogawa-seal",JSON.stringify(seal)); }
+      else{ localStorage.removeItem("edogawa-seal"); }
+    }catch(e){}
+  },[seal,sealLoaded]);
+
+  const[d,setD]=useState({
+    date:td(),customerName:"",propertyName:"",propertyAddress:"",
+    constructionName:"",paymentMethod:"未定",paymentDeadline:"未定",
+    constructionDate:"",completionDate:"",validUntil:"",staff:"",
+    taxRate:"0",marginRate:"30",showSeal:true,
+    notesEstimate:"工事日程はご相談の上お願い致します。\n製品、お客様設備関連以外の弊社設置箇所の保証は1年です。",
+    notesInvoice:"毎度ありがとう御座います。上記期日までにお振込み頂きますよう、何卒宜しくお願い致します。",
+    notesReceipt:"毎度ありがとう御座います。またのご依頼をお待ちしております。",
+    items:Array(3).fill(null).map(emp),
+  });
+
+  const u=useCallback((k,v)=>setD(o=>({...o,[k]:v})),[]);
+  const ui=useCallback((i,k,v)=>setD(o=>{const items=[...o.items];items[i]={...items[i],[k]:v};return{...o,items};}),[]);
+  const addItem=()=>u("items",[...d.items,emp()]);
+  const delItem=i=>u("items",d.items.filter((_,j)=>j!==i));
+  const[dragIdx,setDragIdx]=useState(null);
+  const[overIdx,setOverIdx]=useState(null);
+  const moveItem=(from,to)=>{
+    if(from===to) return;
+    const items=[...d.items];
+    const[moved]=items.splice(from,1);
+    items.splice(to,0,moved);
+    u("items",items);
+  };
+
+  const sub=d.items.reduce((a,i)=>a+(+i.qty||0)*(+i.price||0),0);
+  const tx=Math.floor(sub*(+d.taxRate||0)/100);
+  const tot=sub+tx;
+  // 利益額計算: (販売単価 - 仕入単価) × 数量
+  const totalProfit=d.items.reduce((a,i)=>a+((+i.price||0)-(+i.cost||0))*(+i.qty||0),0);
+  const nk=dt==="estimate"?"notesEstimate":dt==="invoice"?"notesInvoice":"notesReceipt";
+
+  // 書類保存
+  const saveDoc=useCallback((name)=>{
+    const entry={id:Date.now(),name,dt,d:JSON.parse(JSON.stringify(d)),savedAt:new Date().toISOString()};
+    const next=[entry,...savedDocs].slice(0,50); // 最大50件
+    setSavedDocs(next);
+    try{localStorage.setItem("edogawa-saved-docs",JSON.stringify(next));}catch(e){}
+    // クラウド同期（プロキシURL設定時）
+    if(proxyUrl){try{fetch(proxyUrl.replace(/\/$/,"")+"/sync",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(next)});}catch(e){}}
+    return entry;
+  },[dt,d,savedDocs,proxyUrl]);
+
+  // 書類読み込み
+  const loadDoc=useCallback((entry,targetDt)=>{
+    const nd={...entry.d};
+    // 日付を今日に更新
+    nd.date=td();
+    setD(nd);
+    setDt(targetDt||entry.dt);
+    setSec("info");
+    setModal(null);
+  },[]);
+
+  // 書類削除
+  const deleteDoc=useCallback((id)=>{
+    const next=savedDocs.filter(x=>x.id!==id);
+    setSavedDocs(next);
+    try{localStorage.setItem("edogawa-saved-docs",JSON.stringify(next));}catch(e){}
+    if(proxyUrl){try{fetch(proxyUrl.replace(/\/$/,"")+"/sync",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(next)});}catch(e){}}
+  },[savedDocs,proxyUrl]);
+
+  // クラウドへアップロード（手動）
+  const syncPush=useCallback(async()=>{
+    if(!proxyUrl){setSyncStatus("プロキシURL未設定");return;}
+    setSyncStatus("アップロード中...");
+    try{
+      const r=await fetch(proxyUrl.replace(/\/$/,"")+"/sync",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(savedDocs)});
+      if(r.ok)setSyncStatus("✅ クラウドに保存しました");
+      else setSyncStatus("❌ 保存失敗");
+    }catch(e){setSyncStatus("❌ 通信エラー");}
+  },[proxyUrl,savedDocs]);
+
+  // クラウドから取得してマージ（手動）
+  const syncPull=useCallback(async(silent)=>{
+    if(!proxyUrl){if(!silent)setSyncStatus("プロキシURL未設定");return;}
+    if(!silent)setSyncStatus("取得中...");
+    try{
+      const r=await fetch(proxyUrl.replace(/\/$/,"")+"/sync");
+      if(!r.ok){if(!silent)setSyncStatus("❌ 取得失敗");return;}
+      const cloud=await r.json();
+      if(!Array.isArray(cloud)){if(!silent)setSyncStatus("❌ データ形式エラー");return;}
+      // id重複を除いてマージ（クラウド優先）
+      setSavedDocs(prev=>{
+        const map={};
+        [...prev,...cloud].forEach(x=>{if(x&&x.id)map[x.id]=x;});
+        const merged=Object.values(map).sort((a,b)=>b.id-a.id).slice(0,50);
+        try{localStorage.setItem("edogawa-saved-docs",JSON.stringify(merged));}catch(e){}
+        return merged;
+      });
+      if(!silent)setSyncStatus("✅ クラウドから取得しました");
+    }catch(e){if(!silent)setSyncStatus("❌ 通信エラー");}
+  },[proxyUrl]);
+
+  // 起動時にクラウドから自動取得
+  useEffect(()=>{
+    if(proxyUrl) syncPull(true);
+  },[proxyUrl]);
+
+  /* Print: 隠しiframeに書類HTMLを流し込んで印刷 */
+  const printRef=useRef();
+  const[dlModal,setDlModal]=useState(false);
+  const[dlName,setDlName]=useState("");
+  const[dlLoading,setDlLoading]=useState(false);
+
+  const openDl=useCallback(()=>{
+    setDlName(`${DOCS[dt].label}_${d.customerName||"書類"}_${d.date||""}`);
+    setDlModal(true);
+  },[dt,d]);
+
+  // 外部ライブラリ不要のPDF生成
+  const execDl=useCallback(async()=>{
+    const el=printRef.current;
+    if(!el) return;
+    if(dlLoading) return;
+    setDlLoading(true);
+    const node=el.firstChild;
+    if(!node){setDlLoading(false);return;}
+    try{
+      const W=node.scrollWidth||node.offsetWidth;
+      const H=node.scrollHeight||node.offsetHeight;
+      if(!W||!H) throw new Error(`サイズ取得失敗: ${W}x${H}`);
+      // XHTML化
+      const xhtml=new XMLSerializer().serializeToString(node);
+      // SVG作成
+      const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}"><foreignObject width="100%" height="100%">${xhtml}</foreignObject></svg>`;
+      // base64エンコード
+      const b64=btoa(unescape(encodeURIComponent(svg)));
+      // Canvasに描画
+      const sc=2;
+      const cvs=document.createElement("canvas");
+      cvs.width=W*sc;cvs.height=H*sc;
+      const cx=cvs.getContext("2d");
+      cx.scale(sc,sc);
+      cx.fillStyle="#fff";
+      cx.fillRect(0,0,W,H);
+      // 画像読み込み
+      const im=new Image();
+      im.width=W;im.height=H;
+      await new Promise((ok,ng)=>{
+        im.onload=ok;
+        im.onerror=ng;
+        im.src="data:image/svg+xml;base64,"+b64;
+      });
+      cx.drawImage(im,0,0,W,H);
+      // JPEG取得
+      const jpeg=cvs.toDataURL("image/jpeg",0.92);
+      const raw=atob(jpeg.split(",")[1]);
+      const jb=new Uint8Array(raw.length);
+      for(let i=0;i<raw.length;i++)jb[i]=raw.charCodeAt(i);
+      // PDF構築
+      const pw=595.28,ph=841.89,iw=cvs.width,ih=cvs.height;
+      const t=s=>new TextEncoder().encode(s);
+      const o1=t("1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n");
+      const o2=t("2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n");
+      const o3=t(`3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${pw} ${ph}]/Contents 4 0 R/Resources<</XObject<</I 5 0 R>>>>>>endobj\n`);
+      const cs=`q ${pw} 0 0 ${ph} 0 0 cm /I Do Q\n`;
+      const o4=t(`4 0 obj<</Length ${cs.length}>>stream\n${cs}endstream\nendobj\n`);
+      const o5h=t(`5 0 obj<</Type/XObject/Subtype/Image/Width ${iw}/Height ${ih}/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/DCTDecode/Length ${jb.length}>>stream\n`);
+      const o5t=t("\nendstream\nendobj\n");
+      const hdr=t("%PDF-1.4\n");
+      // バイトオフセット計算
+      let pos=hdr.length;
+      const of1=pos;pos+=o1.length;
+      const of2=pos;pos+=o2.length;
+      const of3=pos;pos+=o3.length;
+      const of4=pos;pos+=o4.length;
+      const of5=pos;pos+=o5h.length+jb.length+o5t.length;
+      const xrefPos=pos;
+      const pad=n=>String(n).padStart(10,"0");
+      const xref=t(`xref\n0 6\n0000000000 65535 f \n${pad(of1)} 00000 n \n${pad(of2)} 00000 n \n${pad(of3)} 00000 n \n${pad(of4)} 00000 n \n${pad(of5)} 00000 n \ntrailer<</Size 6/Root 1 0 R>>\nstartxref\n${xrefPos}\n%%EOF`);
+      // 結合
+      const total=hdr.length+o1.length+o2.length+o3.length+o4.length+o5h.length+jb.length+o5t.length+xref.length;
+      const pdf=new Uint8Array(total);
+      let p=0;
+      for(const c of[hdr,o1,o2,o3,o4,o5h,jb,o5t,xref]){pdf.set(c,p);p+=c.length;}
+      // ダウンロード
+      const blob=new Blob([pdf],{type:"application/pdf"});
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;a.download=`${dlName||"書類"}.pdf`;
+      document.body.appendChild(a);a.click();a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),5000);
+      // 自動保存
+      saveDoc(dlName||"書類");
+      setDlModal(false);
+    }catch(e){
+      console.error(e);
+      // SVGが失敗した場合: 書類HTMLファイルをダウンロード（フォールバック）
+      try{
+        const html=el.innerHTML;
+        const full=`<!DOCTYPE html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@300;400;500;700;800&display=swap" rel="stylesheet">
+<style>@page{size:A4 portrait;margin:0;}*{box-sizing:border-box;margin:0;padding:0;}html,body{margin:0;padding:0;background:#fff;}*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;}</style>
+<script>window.onload=function(){setTimeout(function(){window.print();},800);};<\/script>
+</head><body>${html}</body></html>`;
+        const blob=new Blob([full],{type:"text/html;charset=utf-8"});
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement("a");
+        a.href=url;a.download=`${dlName||"書類"}.html`;
+        document.body.appendChild(a);a.click();a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),5000);
+        setDlModal(false);
+      }catch(e2){console.error(e2);}
+    }finally{
+      setDlLoading(false);
+    }
+  },[dlName,dt,d,co,seal,dlLoading,saveDoc]);
+
+  const handleSeal=e=>{const f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onload=ev=>setSeal(ev.target.result);r.readAsDataURL(f);};
+  const[sealKey,setSealKey]=useState(0);
+  const clearSeal=()=>{setSeal(null);setSealKey(k=>k+1);};
+  const pvRef=useRef();
+  const[pvScale,setPvScale]=useState(0.85);
+  useEffect(()=>{
+    if(sec!=="preview"||!pvRef.current) return;
+    const calc=()=>{
+      const cw=pvRef.current?.clientWidth;
+      if(!cw) return;
+      const docW=793.7; // 210mm ≈ 793.7px at 96dpi
+      setPvScale(Math.min(1,((cw-40)/docW)));
+    };
+    calc();
+    const ro=new ResizeObserver(calc);
+    ro.observe(pvRef.current);
+    return()=>ro.disconnect();
+  },[sec]);
+  return(
+    <div className="app">
+      <style>{CSS}</style>
+
+      {/* 隠し印刷用: visibility:hiddenで正しくレンダリングされる */}
+      <div ref={printRef} style={{position:"fixed",left:0,top:0,width:"210mm",visibility:"hidden",zIndex:-9999,pointerEvents:"none"}}>
+        <PrintDoc d={d} dt={dt} co={co} seal={seal} bank={bank}/>
+      </div>
+
+      {/* ── Titlebar ── */}
+      <div className="tbar">
+        <div className="dots">
+          <div className="dot" style={{background:"#ff5f57"}}/>
+          <div className="dot" style={{background:"#febc2e"}}/>
+          <div className="dot" style={{background:"#28c840"}}/>
+        </div>
+        <div className="tbar-c">
+          <span style={{fontSize:15}}>{DOCS[dt].icon}</span>
+          証憑書類作成アプリ — {DOCS[dt].label}
+        </div>
+        <div className="tbar-r">
+          <div className="tot-info" style={{display:"flex",alignItems:"baseline",gap:6,marginRight:8,fontVariantNumeric:"tabular-nums"}}>
+            <span style={{fontSize:11,color:"var(--t3)"}}>合計</span>
+            <span style={{fontSize:16,fontWeight:800,color:"var(--blue)"}}>{fC(tot)}-</span>
+            <span style={{fontSize:10,color:"var(--t3)"}}>（税込{d.taxRate}%）</span>
+            <span style={{fontSize:11,color:"var(--t3)",marginLeft:8}}>利益</span>
+            <span style={{fontSize:14,fontWeight:700,color:"#2e7d32"}}>{fC(totalProfit)}</span>
+          </div>
+          <button className="tb tb-b" onClick={openDl}>🖨 印刷 / PDF</button>
+        </div>
+      </div>
+
+      <div className="bod">
+        {/* ── Sidebar ── */}
+        <div className="sb">
+          <div className="sb-l">セクション</div>
+          {[["info","📋","基本情報"],["items","🔧","明細項目"]].map(([k,ic,lb])=>(
+            <button key={k} className={`sb-i ${sec===k?"on":""}`} onClick={()=>setSec(k)}>
+              <span className="sb-ic">{ic}</span>{lb}
+            </button>
+          ))}
+          <button className="sb-i" onClick={()=>setModal("settings")}>
+            <span className="sb-ic">⚙</span>詳細設定
+          </button>
+          <div className="sb-l" style={{marginTop:12}}>書類タイプ</div>
+          {Object.entries(DOCS).map(([k,v])=>(
+            <button key={k} className={`sb-i ${dt===k&&(sec==="notes")?"on":""}`} onClick={()=>{setDt(k);setSec("notes");}}>
+              <span className="sb-ic">{v.icon}</span>{v.label}
+            </button>
+          ))}
+          <button className={`sb-i ${sec==="preview"?"on":""}`} onClick={()=>setSec("preview")}>
+            <span className="sb-ic">👁</span>プレビュー
+          </button>
+          <div className="sb-div"/>
+          <div className="sb-l">変換</div>
+          <button className="sb-cv" onClick={()=>{setDt("invoice");setSec("notes");}}>📨 請求書に変換</button>
+          <button className="sb-cv" onClick={()=>{setDt("receipt");setSec("notes");}}>📄 領収書に変換</button>
+          <div className="sb-div"/>
+          <div className="sb-l">データ</div>
+          <button className="sb-cv" onClick={()=>setModal("load")}>📥 保存済み書類を読込</button>
+        </div>
+
+        {/* ── Content ── */}
+        <div className="cnt">
+          <div className="mseg">
+            <div className="seg">
+              {Object.entries(DOCS).map(([k,v])=>(
+                <button key={k} className={`seg-b ${dt===k?"on":""}`} onClick={()=>{setDt(k);setSec("notes");}}>{v.label}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* ══ INFO ══ */}
+          {sec==="info"&&(
+            <div className="scr">
+              <div className="mc">
+                <div className="mc-t">基本情報</div>
+                <div className="mg">
+                  <div className="mf ms2"><label>お客様名</label><input value={d.customerName} placeholder="" onChange={e=>u("customerName",e.target.value)}/></div>
+                  <div className="mf"><label>発行日</label><input type="date" value={d.date} onChange={e=>u("date",e.target.value)}/></div>
+                  <div className="mf"><label>担当者</label><input value={d.staff} placeholder="" onChange={e=>u("staff",e.target.value)}/></div>
+                  <div className="mf ms2"><label>物件名称</label><input value={d.propertyName} placeholder="" onChange={e=>u("propertyName",e.target.value)}/></div>
+                  <div className="mf ms2"><label>物件住所</label><input value={d.propertyAddress} placeholder="" onChange={e=>u("propertyAddress",e.target.value)}/></div>
+                  <div className="mf ms2"><label>工事名</label><input value={d.constructionName} placeholder="" onChange={e=>u("constructionName",e.target.value)}/></div>
+                </div>
+              </div>
+              <div className="mc">
+                <div className="mc-t">支払・日程</div>
+                <div className="mg">
+                  <div className="mf"><label>お支払方法</label><select value={d.paymentMethod} onChange={e=>u("paymentMethod",e.target.value)}>{PAY_M.map(m=><option key={m}>{m}</option>)}</select></div>
+                  <div className="mf"><label>お支払期日</label><select value={d.paymentDeadline} onChange={e=>u("paymentDeadline",e.target.value)}>{PAY_D.map(x=><option key={x}>{x}</option>)}</select></div>
+                  <div className="mf"><label>消費税率</label><select value={d.taxRate} onChange={e=>u("taxRate",e.target.value)}><option value="0">なし (0%)</option><option value="8">8%</option><option value="10">10%</option></select></div>
+                  <div className="mf"><label>利益率（販売単価に対する粗利率 %・内掛け）</label>
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      <input type="number" min="0" step="1" value={d.marginRate} style={{flex:1}}
+                        onChange={e=>{
+                          const mr=e.target.value;
+                          setD(o=>{
+                            const m=Math.min(0.99,(+mr||0)/100);
+                            const items=o.items.map(it=>{
+                              if(it.cost) return{...it,price:String(Math.round((+it.cost)/(1-m)))};
+                              return it;
+                            });
+                            return{...o,marginRate:mr,items};
+                          });
+                        }}/>
+                      <span style={{fontSize:13,color:"var(--t3)"}}>%</span>
+                    </div>
+                    <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>販売単価 = 仕入単価 ÷ (1 − 利益率÷100)。仕入単価のある項目の販売単価が自動再計算されます</div>
+                  </div>
+                  <div className="mf" style={{justifyContent:"flex-end"}}>
+                    <label className="tg" onClick={()=>u("showSeal",!d.showSeal)}>
+                      <div className={`tt ${d.showSeal?"on":""}`}><div className="tk"/></div>会社印を表示
+                    </label>
+                    {d.showSeal&&<div style={{display:"flex",alignItems:"center",gap:8,marginTop:6}}>
+                      <div style={{width:36,height:36,borderRadius:4,border:"1px dashed var(--bdr)",display:"flex",alignItems:"center",justifyContent:"center",overflow:"hidden",background:"var(--card)"}}><SealImg size={30} src={seal}/></div>
+                      <button style={{fontSize:11,color:"var(--blue)",background:"none",border:"none",cursor:"pointer",fontFamily:"var(--font)"}} onClick={()=>setModal("settings")}>印影を変更</button>
+                    </div>}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ══ NOTES (per document type) ══ */}
+          {sec==="notes"&&(
+            <div className="scr">
+              <div className="mc">
+                <div className="mc-t">{DOCS[dt].icon} {DOCS[dt].label} — 備考・設定</div>
+                <div className="mg">
+                  {dt==="estimate"&&<><div className="mf"><label>工事予定日</label><input type="date" value={d.constructionDate} onChange={e=>u("constructionDate",e.target.value)}/></div>
+                  <div className="mf"><label>有効期限</label><input type="date" value={d.validUntil} onChange={e=>u("validUntil",e.target.value)}/></div></>}
+                  {dt!=="estimate"&&<div className="mf"><label>工事完了日</label><input type="date" value={d.completionDate} onChange={e=>u("completionDate",e.target.value)}/></div>}
+                </div>
+              </div>
+              <div className="mc">
+                <div className="mc-t">備考（{DOCS[dt].label}）</div>
+                <div className="mf"><textarea value={d[nk]} placeholder="備考欄に表示するテキスト" onChange={e=>u(nk,e.target.value)}/></div>
+              </div>
+            </div>
+          )}
+
+          {/* ══ ITEMS ══ */}
+          {sec==="items"&&(
+            <div className="scr">
+              <div className="mc" style={{padding:0,overflow:"hidden"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",borderBottom:".5px solid var(--bdr)"}}>
+                  <div className="mc-t" style={{margin:0}}>明細項目</div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button className="tb tb-d" style={{fontSize:12,padding:"5px 12px"}} onClick={()=>{
+                      const has=d.items.some(it=>it.name||it.cost||it.price);
+                      if(has&&!window.confirm("現在の明細をカメラ取付工事テンプレートで置き換えますか？")) return;
+                      u("items",TPL_CAMERA.map(([name,unit])=>({...emp(),name,qty:"1",unit})));
+                    }}>📷 カメラ工事テンプレート</button>
+                    <button className="tb tb-b" style={{fontSize:12,padding:"5px 14px"}} onClick={addItem}>＋ 行を追加</button>
+                  </div>
+                </div>
+                <div className="sheet-wrap">
+                  <table className="sheet">
+                    <thead>
+                      <tr>
+                        <th className="sh-grip"></th>
+                        <th className="sh-no">No</th>
+                        <th className="sh-name">品　名</th>
+                        <th className="sh-qty">数量</th>
+                        <th className="sh-unit">呼称</th>
+                        <th className="sh-cost">仕入単価<br/>(税別)</th>
+                        <th className="sh-price">販売単価<br/>(税別)</th>
+                        <th className="sh-amount">金　額</th>
+                        <th className="sh-code">注文コード</th>
+                        <th className="sh-note2">摘　要</th>
+                        <th className="sh-profit">利益額</th>
+                        <th className="sh-del"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {d.items.map((it,i)=>{const amt=(+it.qty||0)*(+it.price||0);const prof=((+it.price||0)-(+it.cost||0))*(+it.qty||0);return(
+                        <tr key={i} className={`sh-row${dragIdx===i?" sh-dragging":""}${overIdx===i?" sh-over":""}`}
+                          draggable
+                          onDragStart={e=>{setDragIdx(i);e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",i);}}
+                          onDragOver={e=>{e.preventDefault();e.dataTransfer.dropEffect="move";setOverIdx(i);}}
+                          onDragLeave={()=>setOverIdx(null)}
+                          onDrop={e=>{e.preventDefault();moveItem(dragIdx,i);setDragIdx(null);setOverIdx(null);}}
+                          onDragEnd={()=>{setDragIdx(null);setOverIdx(null);}}
+                        >
+                          <td className="sh-grip">
+                            <span className="grip-icon grip-desk">⠿</span>
+                            <span className="grip-mob">
+                              <button className="mv-btn" disabled={i===0} onClick={()=>moveItem(i,i-1)}>▲</button>
+                              <button className="mv-btn" disabled={i===d.items.length-1} onClick={()=>moveItem(i,i+1)}>▼</button>
+                            </span>
+                          </td>
+                          <td className="sh-no">{i+1}</td>
+                          <td className="sh-name"><input className="si" value={it.name} placeholder="品名を入力" onChange={e=>ui(i,"name",e.target.value)}/></td>
+                          <td className="sh-qty">
+                            <div className="stepper">
+                              <button className="st-btn" onClick={()=>ui(i,"qty",String(Math.max(0,(+it.qty||0)-1)))}>−</button>
+                              <input className="si si-c st-val" type="number" value={it.qty} placeholder="0" onChange={e=>ui(i,"qty",e.target.value)}/>
+                              <button className="st-btn" onClick={()=>ui(i,"qty",String((+it.qty||0)+1))}>+</button>
+                            </div>
+                          </td>
+                          <td className="sh-unit"><select className="si si-c" value={it.unit} onChange={e=>ui(i,"unit",e.target.value)}>{UNITS.map(x=><option key={x} value={x}>{x||"-"}</option>)}</select></td>
+                          <td className="sh-cost"><input className="si si-r" type="number" value={it.cost} placeholder="0"
+                            onChange={e=>{
+                              const c=e.target.value;const m=Math.min(0.99,(+d.marginRate||0)/100);
+                              setD(o=>{const items=[...o.items];items[i]={...items[i],cost:c,price:c?String(Math.round((+c)/(1-m))):items[i].price};return{...o,items};});
+                            }}/></td>
+                          <td className="sh-price"><input className="si si-r" type="number" value={it.price} placeholder="0" onChange={e=>ui(i,"price",e.target.value)}/></td>
+                          <td className="sh-amount">{amt?fC(amt):""}</td>
+                          <td className="sh-code"><input className="si" value={it.code} placeholder="—" onChange={e=>ui(i,"code",e.target.value)}/></td>
+                          <td className="sh-note2"><input className="si" value={it.note} placeholder="摘要" onChange={e=>ui(i,"note",e.target.value)}/></td>
+                          <td className="sh-profit" style={{color:prof>=0?"#2e7d32":"#c62828",fontWeight:600,textAlign:"right"}}>{prof?fC(prof):""}</td>
+                          <td className="sh-del"><button className="sh-del-btn" onClick={()=>delItem(i)}>×</button></td>
+                        </tr>
+                      );})}
+                    </tbody>
+                    <tfoot>
+                      <tr className="sh-foot"><td colSpan={7} style={{textAlign:"right",fontWeight:600}}>小　計</td><td className="sh-amount" style={{fontWeight:600}}>{fC(sub)}</td><td></td><td></td><td className="sh-profit" style={{textAlign:"right",fontWeight:600,color:"#2e7d32"}}>{fC(totalProfit)}</td><td></td></tr>
+                      <tr className="sh-foot"><td colSpan={7} style={{textAlign:"right",fontWeight:600}}>消費税（{d.taxRate}%）</td><td className="sh-amount" style={{fontWeight:600}}>{fC(tx)}</td><td colSpan={4}></td></tr>
+                      <tr className="sh-total"><td colSpan={7} style={{textAlign:"right",fontWeight:800,fontSize:14}}>合　計</td><td className="sh-amount" style={{fontWeight:800,fontSize:16}}>{fC(tot)}-</td><td colSpan={4}></td></tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ══ PREVIEW ══ */}
+          {sec==="preview"&&(
+            <div className="pvw" ref={pvRef}>
+              <div style={{width:793.7*pvScale,height:1122.5*pvScale,flexShrink:0}}>
+                <div className="pvp" style={{transform:`scale(${pvScale})`,transformOrigin:"top left"}}>
+                  <PrintDoc d={d} dt={dt} co={co} seal={seal} bank={bank}/>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Mobile Bottom Bar ── */}
+      <div className="mbar">
+        {[["info","📋","情報"],["items","🔧","明細"],["notes","📝","備考"],["preview","👁","表示"]].map(([k,ic,lb])=>(
+          <button key={k} className={`mb ${sec===k?"on":""}`} onClick={()=>setSec(k)}>
+            <span className="mb-i">{ic}</span>{lb}
+          </button>
+        ))}
+        <button className="mb" onClick={()=>setModal("settings")}>
+          <span className="mb-i">⚙</span>詳細
+        </button>
+      </div>
+
+      {/* ── Settings Modal ── */}
+      {modal==="settings"&&(
+        <div className="mo-bg" onClick={e=>{if(e.target===e.currentTarget)setModal(null)}}>
+          <div className="mo-bx">
+            <div className="mo-h"><h2>会社情報設定</h2><button className="mo-x" onClick={()=>setModal(null)}>✕</button></div>
+            <div className="mo-bd">
+              <div className="mg" style={{marginBottom:20}}>
+                {[["name","会社名"],["rep","代表者"],["zip","郵便番号"],["addr","住所"],["tel","電話番号"],["email","メールアドレス"]].map(([k,l])=>(
+                  <div className="mf" key={k}><label>{l}</label><input value={co[k]} onChange={e=>setCo({...co,[k]:e.target.value})}/></div>
+                ))}
+              </div>
+              <div style={{borderTop:".5px solid var(--bdr)",paddingTop:16}}>
+                <div style={{fontSize:11,fontWeight:700,color:"var(--t3)",textTransform:"uppercase",letterSpacing:.5,marginBottom:12}}>会社印（角印）</div>
+                <div style={{display:"flex",gap:16,alignItems:"flex-start",flexWrap:"wrap"}}>
+                  <div className="seal-d"><SealImg size={60} src={seal}/></div>
+                  <div style={{flex:1,minWidth:180}}>
+                    <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.6,marginBottom:10}}>印影画像を設定するとデフォルトの角印に代わり書類に反映されます。</div>
+
+                    {/* 方法1: ファイル選択（Mac/PC用） */}
+                    <div style={{marginBottom:8}}>
+                      <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:4}}>方法1: ファイルから選択</div>
+                      <input key={sealKey} type="file" accept="image/*" onChange={handleSeal}
+                        style={{fontSize:14,padding:8,width:"100%"}}/>
+                    </div>
+
+                    {/* 方法2: 貼り付け（Android対応） */}
+                    <div style={{marginBottom:8}}>
+                      <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:4}}>方法2: 画像を貼り付け</div>
+                      <div style={{fontSize:10,color:"var(--t3)",marginBottom:4}}>画像をコピーしてからタップ→長押し→貼り付け</div>
+                      <div
+                        contentEditable
+                        suppressContentEditableWarning
+                        onPaste={e=>{
+                          e.preventDefault();
+                          const items=e.clipboardData?.items;
+                          if(!items) return;
+                          for(let i=0;i<items.length;i++){
+                            if(items[i].type.indexOf("image")!==-1){
+                              const file=items[i].getAsFile();
+                              const r=new FileReader();
+                              r.onload=ev=>setSeal(ev.target.result);
+                              r.readAsDataURL(file);
+                              e.target.textContent="✅ 貼り付け完了";
+                              return;
+                            }
+                          }
+                          e.target.textContent="⚠ 画像が見つかりません";
+                        }}
+                        style={{minHeight:48,padding:12,border:"2px dashed var(--bdr)",borderRadius:8,background:"var(--inp)",
+                          fontSize:13,color:"var(--t3)",textAlign:"center",lineHeight:"24px",cursor:"text",
+                          WebkitUserSelect:"text",userSelect:"text"}}
+                      >ここをタップして画像を貼り付け</div>
+                    </div>
+
+                    {/* 方法3: URL入力 */}
+                    <div style={{marginBottom:8}}>
+                      <div style={{fontSize:11,fontWeight:600,color:"var(--t2)",marginBottom:4}}>方法3: 画像URLを入力</div>
+                      <div style={{display:"flex",gap:6}}>
+                        <input id="seal-url-input" placeholder="https://..." style={{flex:1,fontSize:13}}/>
+                        <button className="tb tb-b" style={{fontSize:12,whiteSpace:"nowrap"}} onClick={()=>{
+                          const url=document.getElementById("seal-url-input")?.value;
+                          if(!url) return;
+                          const img=new Image();
+                          img.crossOrigin="anonymous";
+                          img.onload=()=>{
+                            const c=document.createElement("canvas");
+                            c.width=img.width;c.height=img.height;
+                            c.getContext("2d").drawImage(img,0,0);
+                            try{setSeal(c.toDataURL("image/png"));}
+                            catch(e){setSeal(url);}
+                          };
+                          img.onerror=()=>setSeal(url);
+                          img.src=url;
+                        }}>読込</button>
+                      </div>
+                    </div>
+
+                    {seal&&<button className="tb tb-d" style={{fontSize:12,color:"var(--red)",minHeight:44,width:"100%",marginTop:4}} onClick={clearSeal}>デフォルトに戻す</button>}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{borderTop:".5px solid var(--bdr)",paddingTop:16,marginTop:16}}>
+                <div style={{fontSize:11,fontWeight:700,color:"var(--t3)",textTransform:"uppercase",letterSpacing:.5,marginBottom:12}}>振込先情報（請求書に表示）</div>
+                <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.6,marginBottom:12}}>
+                  請求書の備考欄に表示する振込先です。<span style={{fontSize:11,color:"var(--t3)"}}>この端末内にのみ保存されます（公開ソースには含まれません）。</span>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                  <div className="mf"><label>銀行名</label><input value={bank.name} placeholder="" onChange={e=>setBank({...bank,name:e.target.value})}/></div>
+                  <div className="mf"><label>支店名</label><input value={bank.branch} placeholder="" onChange={e=>setBank({...bank,branch:e.target.value})}/></div>
+                  <div className="mf"><label>口座種別</label><select value={bank.type} onChange={e=>setBank({...bank,type:e.target.value})}><option>普通</option><option>当座</option></select></div>
+                  <div className="mf"><label>口座番号</label><input value={bank.number} placeholder="" onChange={e=>setBank({...bank,number:e.target.value})}/></div>
+                  <div className="mf" style={{gridColumn:"1 / -1"}}><label>口座名義</label><input value={bank.holder} placeholder="" onChange={e=>setBank({...bank,holder:e.target.value})}/></div>
+                </div>
+                <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,marginBottom:12,cursor:"pointer"}}>
+                  <input type="checkbox" checked={bank.feeNote} onChange={e=>setBank({...bank,feeNote:e.target.checked})} style={{width:"auto"}}/>
+                  「振込手数料はお客様負担」の一文を記載する
+                </label>
+                <button className="tb tb-b" style={{fontSize:12}} onClick={()=>{
+                  try{localStorage.setItem("edogawa-bank-info",JSON.stringify(bank));}catch(e){}
+                  alert("振込先情報を保存しました");
+                }}>振込先を保存</button>
+              </div>
+
+              <div style={{borderTop:".5px solid var(--bdr)",paddingTop:16,marginTop:16}}>
+                <div style={{fontSize:11,fontWeight:700,color:"var(--t3)",textTransform:"uppercase",letterSpacing:.5,marginBottom:12}}>クラウド同期（複数端末でデータ共有）</div>
+                <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.6,marginBottom:12}}>
+                  Cloudflare WorkerのURLを設定すると、保存した書類を複数の端末で共有できます。<br/>
+                  <span style={{fontSize:11,color:"var(--t3)"}}>各端末に同じURLを設定してください。未設定の場合は端末内のみに保存されます。</span>
+                </div>
+                <div className="mf">
+                  <label>プロキシURL（Cloudflare Worker）</label>
+                  <div style={{display:"flex",gap:6}}>
+                    <input value={proxyUrl} placeholder="https://xxxx.workers.dev" style={{flex:1,fontSize:13}}
+                      onChange={e=>setProxyUrl(e.target.value)}/>
+                    <button className="tb tb-b" style={{fontSize:12,whiteSpace:"nowrap"}} onClick={()=>{
+                      try{localStorage.setItem("edogawa-proxy-url",proxyUrl);}catch(e){}
+                      alert("プロキシURLを保存しました");
+                    }}>保存</button>
+                  </div>
+                  <div style={{fontSize:10,color:"var(--t3)",marginTop:4}}>同梱の cloudflare-worker.js をデプロイし、KVストレージを設定したWorkerのURLを入力してください。</div>
+                </div>
+              </div>
+
+              <div style={{marginTop:20,textAlign:"right"}}><button className="tb tb-b" onClick={()=>setModal(null)}>完了</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Download Modal ── */}
+      {dlModal&&(
+        <div className="mo-bg" onClick={e=>{if(e.target===e.currentTarget)setDlModal(false)}}>
+          <div className="mo-bx" style={{width:420}}>
+            <div className="mo-h"><h2>📄 ファイル名を入力</h2><button className="mo-x" onClick={()=>setDlModal(false)}>✕</button></div>
+            <div className="mo-bd">
+              <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.6,marginBottom:12}}>
+                ファイル名を入力してPDFをダウンロードできます。
+              </div>
+              <div className="mf" style={{marginBottom:16}}>
+                <label>ファイル名</label>
+                <div style={{display:"flex",alignItems:"center",gap:4}}>
+                  <input value={dlName} onChange={e=>setDlName(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")execDl();}} autoFocus style={{flex:1}}/>
+                  <span style={{fontSize:12,color:"var(--t3)",flexShrink:0}}>.pdf</span>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                <button className="tb tb-d" onClick={()=>setDlModal(false)} disabled={dlLoading}>キャンセル</button>
+                <button className="tb tb-b" onClick={execDl} disabled={dlLoading}>{dlLoading?"⏳ PDF生成中...":"📄 PDFダウンロード"}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Load Document Modal ── */}
+      {modal==="load"&&(
+        <div className="mo-bg" onClick={e=>{if(e.target===e.currentTarget)setModal(null)}}>
+          <div className="mo-bx" style={{width:520,maxHeight:"80vh"}}>
+            <div className="mo-h"><h2>📥 保存済み書類を読込</h2><button className="mo-x" onClick={()=>setModal(null)}>✕</button></div>
+            <div className="mo-bd" style={{maxHeight:"60vh",overflow:"auto"}}>
+              {proxyUrl&&(
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",marginBottom:12,background:"var(--inp)",borderRadius:8,flexWrap:"wrap"}}>
+                  <span style={{fontSize:12,fontWeight:600}}>☁ クラウド同期</span>
+                  <button className="tb tb-d" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>syncPull(false)}>↓ 取得</button>
+                  <button className="tb tb-d" style={{fontSize:11,padding:"4px 10px"}} onClick={syncPush}>↑ 保存</button>
+                  {syncStatus&&<span style={{fontSize:11,color:"var(--t2)"}}>{syncStatus}</span>}
+                </div>
+              )}
+              {!proxyUrl&&(
+                <div style={{fontSize:11,color:"var(--t3)",padding:"8px 10px",marginBottom:12,background:"var(--inp)",borderRadius:8}}>
+                  💡 設定でプロキシURLを登録すると、複数端末でデータを共有できます。
+                </div>
+              )}
+              {savedDocs.length===0?(
+                <div style={{textAlign:"center",padding:"30px 0",color:"var(--t3)",fontSize:13}}>
+                  <div style={{fontSize:32,marginBottom:8}}>📂</div>
+                  保存済みの書類はありません。<br/>
+                  <span style={{fontSize:11}}>PDFをダウンロードすると自動で保存されます。</span>
+                </div>
+              ):(
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {savedDocs.map(doc=>(
+                    <div key={doc.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:8,border:".5px solid var(--bdr)",background:"var(--card)"}}>
+                      <span style={{fontSize:20}}>{DOCS[doc.dt]?.icon||"📄"}</span>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{doc.name}</div>
+                        <div style={{fontSize:10,color:"var(--t3)",marginTop:2}}>
+                          {DOCS[doc.dt]?.label||doc.dt} ・ {doc.d?.customerName||"顧客未設定"} ・ {new Date(doc.savedAt).toLocaleDateString("ja-JP")}
+                        </div>
+                      </div>
+                      <div style={{display:"flex",gap:4,flexShrink:0}}>
+                        <button className="tb tb-b" style={{fontSize:11,padding:"4px 10px"}} onClick={()=>loadDoc(doc,doc.dt)}>そのまま読込</button>
+                        {doc.dt==="estimate"&&<>
+                          <button className="tb tb-d" style={{fontSize:11,padding:"4px 8px"}} onClick={()=>loadDoc(doc,"invoice")}>→請求書</button>
+                          <button className="tb tb-d" style={{fontSize:11,padding:"4px 8px"}} onClick={()=>loadDoc(doc,"receipt")}>→領収書</button>
+                        </>}
+                        {doc.dt==="invoice"&&
+                          <button className="tb tb-d" style={{fontSize:11,padding:"4px 8px"}} onClick={()=>loadDoc(doc,"receipt")}>→領収書</button>
+                        }
+                        <button style={{fontSize:11,padding:"4px 8px",background:"none",border:"none",color:"var(--red)",cursor:"pointer",fontFamily:"var(--font)"}} onClick={()=>deleteDoc(doc.id)}>削除</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
