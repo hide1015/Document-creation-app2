@@ -15,5 +15,5 @@
 
 【データ同期(複数端末共有)】
 cloudflare-worker.js をCloudflare Workerにデプロイし、KVストレージ(EDOGAWA_KV)を
-バインド。WorkerのURLをアプリ設定「プロキシURL」に入力。詳細はworker冒頭コメント参照。
+バインド。WorkerのURLをアプリ設定「プロキシURL」に入力。詳細はworker冒頭コメント参照。。
 ======================================================
