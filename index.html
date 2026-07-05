@@ -6,7 +6,6 @@
 <title>証憑書類作成アプリ — 見積書・請求書・領収書</title>
 <meta name="theme-color" content="#1b3a5c">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="証憑書類作成">
 <meta name="mobile-web-app-capable" content="yes">
 <link rel="manifest" href="manifest.json">
@@ -20,9 +19,7 @@
 <body>
 <div id="root"></div>
 <script>
-if("serviceWorker" in navigator){
-  window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(e=>console.log("SW登録失敗",e));});
-}
+if("serviceWorker" in navigator){window.addEventListener("load",()=>{navigator.serviceWorker.register("sw.js").catch(e=>console.log("SW",e));});}
 </script>
 <script>
 const {
@@ -774,6 +771,11 @@ function App() {
     holder: "",
     feeNote: true
   });
+  const [pdfModal, setPdfModal] = useState(false);
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfResult, setPdfResult] = useState(null);
+  const [pdfError, setPdfError] = useState("");
+  const [pdfName, setPdfName] = useState("");
 
   // プロキシURL・振込先情報をlocalStorageから読み込み
   useEffect(() => {
@@ -1008,6 +1010,151 @@ function App() {
   useEffect(() => {
     if (proxyUrl) syncPull(true);
   }, [proxyUrl]);
+
+  // PDF/画像から見積書データをAI抽出
+  const extractPdf = useCallback(async file => {
+    if (!file) return;
+    if (!proxyUrl) {
+      setPdfError("先に詳細設定でプロキシURL（Cloudflare Worker）を設定してください。");
+      return;
+    }
+    setPdfLoading(true);
+    setPdfResult(null);
+    setPdfError("");
+    setPdfName(file.name);
+    try {
+      const b64 = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(String(r.result).split(",")[1]);
+        r.onerror = rej;
+        r.readAsDataURL(file);
+      });
+      const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+      const media = isPdf ? "application/pdf" : file.type || "image/jpeg";
+      const src = isPdf ? {
+        type: "document",
+        source: {
+          type: "base64",
+          media_type: "application/pdf",
+          data: b64
+        }
+      } : {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: media,
+          data: b64
+        }
+      };
+      const prompt = `この見積書・請求書・領収書の画像/PDFを読み取り、以下のJSON形式「のみ」で返答してください。JSON以外の文章は一切書かないこと。
+
+{"docType":"estimate|invoice|receipt","customerName":"お客様名","propertyName":"物件名称","propertyAddress":"物件住所","constructionName":"工事名","taxRate":"0|8|10","items":[{"name":"品名","qty":"数量の数値","unit":"呼称(式/個/M/台/枚)","price":"単価の数値","note":"摘要"}],"notes":"備考"}
+
+ルール:
+- docType: 「見積書/御見積書」ならestimate、「請求書」ならinvoice、「領収書」ならreceipt
+- 金額の数字はカンマ・¥を除いた数値のみ。読み取れない項目は空文字 ""
+- items は明細表の各行を上から順に。合計・小計・消費税の行は含めない
+- 数字は記載された通り正確に転記し、推測しない`;
+      const res = await fetch(proxyUrl.replace(/\/$/, "") + "/ai", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 2048,
+          messages: [{
+            role: "user",
+            content: [src, {
+              type: "text",
+              text: prompt
+            }]
+          }]
+        })
+      });
+      if (!res.ok) {
+        setPdfError(`読み取りエラー (${res.status})。Worker設定・APIキーをご確認ください。`);
+        setPdfLoading(false);
+        return;
+      }
+      const data = await res.json();
+      if (data.error) {
+        setPdfError("エラー: " + (data.error.message || "不明"));
+        setPdfLoading(false);
+        return;
+      }
+      const text = data.content?.filter(c => c.type === "text").map(c => c.text).join("") || "";
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) {
+        setPdfError("データを抽出できませんでした。鮮明なPDF/画像をお試しください。");
+        setPdfLoading(false);
+        return;
+      }
+      const parsed = JSON.parse(m[0]);
+      parsed.items = (parsed.items || []).map(it => ({
+        ...emp(),
+        name: it.name || "",
+        qty: String(it.qty || ""),
+        unit: it.unit || "",
+        price: String(it.price || ""),
+        note: it.note || ""
+      }));
+      setPdfResult(parsed);
+    } catch (e) {
+      setPdfError("読み取りに失敗しました: " + (e.message || "通信エラー"));
+    } finally {
+      setPdfLoading(false);
+    }
+  }, [proxyUrl]);
+
+  // 抽出結果をアプリに反映＆保存（クラウド同期）
+  const applyPdf = useCallback(() => {
+    if (!pdfResult) return;
+    const targetDt = ["estimate", "invoice", "receipt"].includes(pdfResult.docType) ? pdfResult.docType : "estimate";
+    const nk2 = targetDt === "estimate" ? "notesEstimate" : targetDt === "invoice" ? "notesInvoice" : "notesReceipt";
+    const nd = {
+      ...d,
+      date: td(),
+      customerName: pdfResult.customerName || "",
+      propertyName: pdfResult.propertyName || "",
+      propertyAddress: pdfResult.propertyAddress || "",
+      constructionName: pdfResult.constructionName || "",
+      taxRate: ["0", "8", "10"].includes(String(pdfResult.taxRate)) ? String(pdfResult.taxRate) : "0",
+      items: pdfResult.items && pdfResult.items.length ? pdfResult.items : d.items
+    };
+    if (pdfResult.notes) nd[nk2] = pdfResult.notes;
+    setD(nd);
+    setDt(targetDt);
+    // 保存（クラウド同期）
+    const name = (pdfResult.customerName || "PDF読込") + "（PDF取込）";
+    const entry = {
+      id: Date.now(),
+      name,
+      dt: targetDt,
+      d: JSON.parse(JSON.stringify(nd)),
+      savedAt: new Date().toISOString()
+    };
+    const next = [entry, ...savedDocs].slice(0, 50);
+    setSavedDocs(next);
+    try {
+      localStorage.setItem("edogawa-saved-docs", JSON.stringify(next));
+    } catch (e) {}
+    if (proxyUrl) {
+      try {
+        fetch(proxyUrl.replace(/\/$/, "") + "/sync", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(next)
+        });
+      } catch (e) {}
+    }
+    setPdfModal(false);
+    setPdfResult(null);
+    setPdfName("");
+    setSec("info");
+  }, [pdfResult, d, savedDocs, proxyUrl]);
 
   /* Print: 隠しiframeに書類HTMLを流し込んで印刷 */
   const printRef = useRef();
@@ -2290,7 +2437,22 @@ function App() {
       maxHeight: "60vh",
       overflow: "auto"
     }
-  }, proxyUrl && /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tb tb-b",
+    style: {
+      width: "100%",
+      marginBottom: 12,
+      fontSize: 13,
+      padding: "8px"
+    },
+    onClick: () => {
+      setModal(null);
+      setPdfModal(true);
+      setPdfResult(null);
+      setPdfError("");
+      setPdfName("");
+    }
+  }, "📄 PDF・画像から読込（旧データ取込）"), proxyUrl && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -2435,7 +2597,241 @@ function App() {
       fontFamily: "var(--font)"
     },
     onClick: () => deleteDoc(doc.id)
-  }, "削除")))))))));
+  }, "削除")))))))), pdfModal && /*#__PURE__*/React.createElement("div", {
+    className: "mo-bg",
+    onClick: e => {
+      if (e.target === e.currentTarget) {
+        setPdfModal(false);
+        setPdfResult(null);
+      }
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mo-bx",
+    style: {
+      width: 560,
+      maxHeight: "88vh"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "mo-h"
+  }, /*#__PURE__*/React.createElement("h2", null, "📄 PDF・画像から読込"), /*#__PURE__*/React.createElement("button", {
+    className: "mo-x",
+    onClick: () => {
+      setPdfModal(false);
+      setPdfResult(null);
+    }
+  }, "✕")), /*#__PURE__*/React.createElement("div", {
+    className: "mo-bd",
+    style: {
+      maxHeight: "72vh",
+      overflow: "auto"
+    }
+  }, !pdfResult && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "var(--t2)",
+      lineHeight: 1.6,
+      marginBottom: 14
+    }
+  }, "過去に作成したPDFや画像の見積書・請求書を読み込み、内容を取り込みます。", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#c77"
+    }
+  }, "※ AIが画像を読み取るため、内容に誤りが出る場合があります。取込前に必ず確認画面でご確認ください。プロキシURL（Cloudflare Worker）とAPIキーの設定が必要です。")), !pdfLoading && /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "block",
+      border: "2px dashed var(--bdr)",
+      borderRadius: 10,
+      padding: "28px 16px",
+      textAlign: "center",
+      cursor: "pointer",
+      background: "var(--inp)"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "file",
+    accept: "application/pdf,image/*",
+    style: {
+      display: "none"
+    },
+    onChange: e => {
+      const f = e.target.files && e.target.files[0];
+      if (f) extractPdf(f);
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 32,
+      marginBottom: 8
+    }
+  }, "📄"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      fontWeight: 600
+    }
+  }, "PDF・画像ファイルを選択"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "var(--t3)",
+      marginTop: 4
+    }
+  }, "タップしてファイルを選んでください")), pdfLoading && /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      padding: "40px 0",
+      color: "var(--t3)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 28,
+      marginBottom: 10,
+      animation: "spin 1s linear infinite"
+    }
+  }, "⏳"), "AIが読み取り中です...", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11
+    }
+  }, pdfName)), pdfError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      textAlign: "center",
+      padding: "16px",
+      color: "#c62828",
+      fontSize: 13,
+      background: "#fdecea",
+      borderRadius: 8,
+      lineHeight: 1.6
+    }
+  }, "⚠ ", pdfError)), pdfResult && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#2e7d32",
+      fontWeight: 600,
+      marginBottom: 12
+    }
+  }, "✅ 読み取り完了。内容を確認してください（必要なら取込後に編集できます）"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      lineHeight: 1.7,
+      background: "var(--inp)",
+      borderRadius: 8,
+      padding: "12px 14px",
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--t3)"
+    }
+  }, "種別:"), " ", pdfResult.docType === "invoice" ? "請求書" : pdfResult.docType === "receipt" ? "領収書" : "見積書"), pdfResult.customerName && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--t3)"
+    }
+  }, "お客様:"), " ", pdfResult.customerName), pdfResult.propertyName && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--t3)"
+    }
+  }, "物件:"), " ", pdfResult.propertyName), pdfResult.constructionName && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--t3)"
+    }
+  }, "工事名:"), " ", pdfResult.constructionName), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--t3)"
+    }
+  }, "明細:"), " ", pdfResult.items.length, "件")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: "32vh",
+      overflow: "auto",
+      border: ".5px solid var(--bdr)",
+      borderRadius: 8,
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      fontSize: 12,
+      borderCollapse: "collapse"
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: "var(--inp)"
+    }
+  }, /*#__PURE__*/React.createElement("th", {
+    style: {
+      padding: "6px 8px",
+      textAlign: "left"
+    }
+  }, "品名"), /*#__PURE__*/React.createElement("th", {
+    style: {
+      padding: "6px 8px"
+    }
+  }, "数量"), /*#__PURE__*/React.createElement("th", {
+    style: {
+      padding: "6px 8px"
+    }
+  }, "呼称"), /*#__PURE__*/React.createElement("th", {
+    style: {
+      padding: "6px 8px",
+      textAlign: "right"
+    }
+  }, "単価"), /*#__PURE__*/React.createElement("th", {
+    style: {
+      padding: "6px 8px",
+      textAlign: "left"
+    }
+  }, "摘要"))), /*#__PURE__*/React.createElement("tbody", null, pdfResult.items.map((it, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i,
+    style: {
+      borderTop: ".5px solid var(--bdr)"
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "5px 8px"
+    }
+  }, it.name), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "5px 8px",
+      textAlign: "center"
+    }
+  }, it.qty), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "5px 8px",
+      textAlign: "center"
+    }
+  }, it.unit), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "5px 8px",
+      textAlign: "right"
+    }
+  }, it.price ? "¥" + Number(it.price).toLocaleString() : ""), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "5px 8px"
+    }
+  }, it.note)))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#c77",
+      marginBottom: 12
+    }
+  }, "※ 金額・数量に誤りがないかご確認ください。仕入単価・注文コードはPDFに無いため空欄になります。"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tb tb-d",
+    style: {
+      flex: 1
+    },
+    onClick: () => {
+      setPdfResult(null);
+      setPdfName("");
+    }
+  }, "やり直す"), /*#__PURE__*/React.createElement("button", {
+    className: "tb tb-b",
+    style: {
+      flex: 2
+    },
+    onClick: applyPdf
+  }, "この内容で取込・保存（クラウド同期）")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 </script>
