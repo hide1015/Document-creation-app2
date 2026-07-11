@@ -772,6 +772,13 @@ function App() {
       if (p) setProxyUrl(p);
     } catch (e) {}
     try {
+      const c = localStorage.getItem("edogawa-company-info");
+      if (c) setCo({
+        ...CO0,
+        ...JSON.parse(c)
+      });
+    } catch (e) {}
+    try {
       const b = localStorage.getItem("edogawa-bank-info");
       if (b) setBank({
         name: "",
@@ -1981,7 +1988,7 @@ function App() {
   }, /*#__PURE__*/React.createElement("div", {
     className: "mg",
     style: {
-      marginBottom: 20
+      marginBottom: 12
     }
   }, [["name", "会社名"], ["rep", "代表者"], ["zip", "郵便番号"], ["addr", "住所"], ["tel", "電話番号"], ["email", "メールアドレス"]].map(([k, l]) => /*#__PURE__*/React.createElement("div", {
     className: "mf",
@@ -1993,6 +2000,31 @@ function App() {
       [k]: e.target.value
     })
   })))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 20,
+      display: "flex",
+      justifyContent: "flex-end",
+      flexDirection: "column",
+      alignItems: "flex-end"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "tb tb-b",
+    style: {
+      fontSize: 12
+    },
+    onClick: () => {
+      try {
+        localStorage.setItem("edogawa-company-info", JSON.stringify(co));
+      } catch (e) {}
+      alert("会社情報を保存しました");
+    }
+  }, "会社情報を保存"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "var(--t3)",
+      marginTop: 6
+    }
+  }, "この端末内に保存され、次回以降も自動で入力されます。")), /*#__PURE__*/React.createElement("div", {
     style: {
       borderTop: ".5px solid var(--bdr)",
       paddingTop: 16
@@ -2049,7 +2081,8 @@ function App() {
     style: {
       fontSize: 14,
       padding: 8,
-      width: "100%"
+      width: "100%",
+      direction: "rtl"
     }
   })), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2259,7 +2292,12 @@ function App() {
     style: {
       width: "auto"
     }
-  }), "「振込手数料はお客様負担」の一文を記載する"), /*#__PURE__*/React.createElement("button", {
+  }), "「振込手数料はお客様負担」の一文を記載する"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-end"
+    }
+  }, /*#__PURE__*/React.createElement("button", {
     className: "tb tb-b",
     style: {
       fontSize: 12
@@ -2270,7 +2308,7 @@ function App() {
       } catch (e) {}
       alert("振込先情報を保存しました");
     }
-  }, "振込先を保存")), /*#__PURE__*/React.createElement("div", {
+  }, "振込先を保存"))), /*#__PURE__*/React.createElement("div", {
     style: {
       borderTop: ".5px solid var(--bdr)",
       paddingTop: 16,
